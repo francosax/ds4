@@ -1322,11 +1322,47 @@ __global__ void dense_rescale(float *out, const float *scales,
     if (i < (uint64_t)M*N) out[i] *= scales[i/M];
 }
 
+/* hipBLASLt 1.4.1 builds whose fixed solution indices were measured on
+ * gfx1151. Indices are build-specific: the same number names a different
+ * kernel in each build, so every table below is keyed by the build. */
+enum {
+    QWEN_HIPBLASLT_UNKNOWN = 0,
+    QWEN_HIPBLASLT_8D1AE90E,   /* ROCm 10.0 */
+    QWEN_HIPBLASLT_39D8D603,   /* ROCm 10.1 */
+};
+
+static int qwen_hipblaslt_build(void) {
+    int version = 0;
+    char revision[128] = {};
+    if (hipblasLtGetVersion(g_hipblaslt, &version) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtGetGitRevision(g_hipblaslt, revision) != HIPBLAS_STATUS_SUCCESS ||
+        version != 100401) return QWEN_HIPBLASLT_UNKNOWN;
+    if (!strcmp(revision, "8d1ae90e")) return QWEN_HIPBLASLT_8D1AE90E;
+    if (!strcmp(revision, "39d8d603")) return QWEN_HIPBLASLT_39D8D603;
+    return QWEN_HIPBLASLT_UNKNOWN;
+}
+
+/* ROCm 10.1 (39d8d603): 2540/2541/2542 are the HSS WMMA kernels with
+ * MT32x32x32, MT96x32x32 and MT96x96x32 tiles. Measured with the same
+ * layouts as hipblaslt_gemm_plan_get(); the default heuristic picks a
+ * non-SAV MT32x32x64 kernel that runs at about a third of their speed. */
+static int dense_half_solution_39d8d603(unsigned M, unsigned T, unsigned K, unsigned stride) {
+    if (T != 32) return T >= 512 ? 2542 : 2540;
+    if ((M == 1344 && K == 6144 && stride == 2560) ||
+        (M == 1600 && K == 5120 && stride == 2560) ||
+        (M == 2880 && K == 2560 && stride == 6144) ||
+        (M == 3264 && K == 2560 &&
+         (stride == 6144 || stride == 10240 || stride == 12288)) ||
+        (M == 10240 && K == 320 && stride == 10240)) return 2541;
+    return 2540;
+}
+
 /* F16/Q8 products use FP32 accumulation and output, including strided
  * output slices. This gfx1151 library build's first heuristic is a slow VALU
  * kernel; use the measured zero-workspace WMMA solution after support checks.
  * An unknown library or unsupported shape keeps the ordinary BLAS fallback. */
-static int dense_half_solution(unsigned M, unsigned T, unsigned K, unsigned stride) {
+static int dense_half_solution(int build, unsigned M, unsigned T, unsigned K, unsigned stride) {
+    if (build == QWEN_HIPBLASLT_39D8D603) return dense_half_solution_39d8d603(M,T,K,stride);
     if (T != 32) return 2539;
     if ((M == 1344 && K == 6144 && stride == 2560) ||
         (M == 2880 && K == 2560 && stride == 6144) ||
@@ -1351,16 +1387,13 @@ static int dense_half_product(float *out, const __half *w, const __half *x,
         unsigned M, unsigned T, unsigned K, unsigned stride,
         float alpha, float beta, const char *label) {
     if (ds4_rocm_is_gfx1151() && g_hipblaslt_ready && T >= 32) {
-        int version = 0;
-        char revision[128] = {};
-        if (hipblasLtGetVersion(g_hipblaslt, &version) == HIPBLAS_STATUS_SUCCESS &&
-            hipblasLtGetGitRevision(g_hipblaslt, revision) == HIPBLAS_STATUS_SUCCESS &&
-            version == 100401 && !strcmp(revision, "8d1ae90e")) {
+        const int build = qwen_hipblaslt_build();
+        if (build != QWEN_HIPBLASLT_UNKNOWN) {
             // Long WMMA accumulation failed the independent FP32 projection
             // bound. Sum shorter K segments; retain the original row strides.
             const unsigned segment = K > 4096 ? 1024 : K;
             const unsigned tail = K % segment ? K % segment : segment;
-            const int solution = dense_half_solution(M,T,K,stride);
+            const int solution = dense_half_solution(build,M,T,K,stride);
             if (hipblaslt_gemm_plan_get(M,T,segment,label,HIP_R_32F,solution,stride,K) &&
                 hipblaslt_gemm_plan_get(M,T,tail,label,HIP_R_32F,solution,stride,K)) {
                 // Preflight every layout before writing any output: fallback
@@ -1600,16 +1633,15 @@ static int dense_blas(float *out, const float *x, const char *w,
 #undef QWEN_UNPACK
             if (!launched()) return 0;
         }
-        const int fp32_solution = T == 32 && K == 2560 && n == 48 ? 2842 :
-                                  T == 32 && K == 2560 && n == 512 ? 3019 :
-                                  T >= 512 && K == 2560 && (n == 48 || n == 512) ? 2921 : -1;
-        if (!type && !g_quality_mode && fp32_solution >= 0 &&
-                ds4_rocm_is_gfx1151() && g_hipblaslt_ready) {
-            int version = 0;
-            char revision[128] = {};
-            if (hipblasLtGetVersion(g_hipblaslt,&version) == HIPBLAS_STATUS_SUCCESS &&
-                    hipblasLtGetGitRevision(g_hipblaslt,revision) == HIPBLAS_STATUS_SUCCESS &&
-                    version == 100401 && !strcmp(revision,"8d1ae90e")) {
+        if (!type && !g_quality_mode && K == 2560 && (n == 48 || n == 512) &&
+                (T == 32 || T >= 512) && ds4_rocm_is_gfx1151() && g_hipblaslt_ready) {
+            const int build = qwen_hipblaslt_build();
+            int fp32_solution = -1;
+            if (build == QWEN_HIPBLASLT_8D1AE90E)
+                fp32_solution = T == 32 ? (n == 48 ? 2842 : 3019) : 2921;
+            else if (build == QWEN_HIPBLASLT_39D8D603)
+                fp32_solution = T == 32 ? (n == 48 ? 2860 : 3022) : (n == 48 ? 2928 : 2906);
+            if (fp32_solution >= 0) {
                 cuda_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
                     n,T,K,"Qwen FP32 projection",HIP_R_32F,fp32_solution,M,K,HIP_R_32F);
                 if (p) {
