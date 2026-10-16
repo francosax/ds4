@@ -59164,7 +59164,7 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     X(score) X(tile_max) X(sel_blocks) X(sel_tokens) X(n_sel) X(attn_part) \
     X(router) X(selected) X(weights) X(mid) X(part) X(sh_gate_logit) \
     X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out) \
-    X(hc_u) X(hc_lo_act)
+    X(hc_u) X(hc_lo_act) X(emb_ids)
 
 typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
@@ -59183,6 +59183,8 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *score, *tile_max, *sel_blocks, *sel_tokens, *n_sel, *attn_part;
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
+    /* token ids of the rows whose embeddings are gathered on the GPU */
+    ds4_gpu_tensor *emb_ids;
     ds4_gpu_tensor *logits;
     /* Arena only, grown on demand: one logit row per batch member, the
      * attention rows' cache table (one entry per row and layer) and their
@@ -59199,7 +59201,7 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *inj_alt;
     /* MTP: staged predictor input, its residual, and the recurrent-state
      * snapshot that verify rollback restores */
-    ds4_gpu_tensor *mtp_e, *mtp_cat, *mtp_proj, *mtp_R, *mtp_argmax, *mtp_argmax_tmp;
+    ds4_gpu_tensor *mtp_e, *mtp_cat, *mtp_proj, *mtp_R, *mtp_argmax, *mtp_argmax_tmp, *mtp_ids;
     /* MTP draft head over a ranked vocabulary subset: gathered Q8 rows, their
      * token ids, and whether the lazy load was attempted */
     ds4_gpu_tensor *draft_head;
@@ -59341,7 +59343,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
-        &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
+        &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp, &g->mtp_ids,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head, &g->steer_dirs,
     };
@@ -59561,6 +59563,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(sh_out, T * E);
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
+    QWEN4_ALLOC(emb_ids, T);   /* int32 ids in f32-sized slots */
     g->host_row = xmalloc(T * hc_dim * sizeof(float));
 
 private_state:
@@ -59575,6 +59578,7 @@ private_state:
         QWEN4_ALLOC(mtp_R, 3u * hc_dim);
         QWEN4_ALLOC(mtp_argmax, 1u);
         QWEN4_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 2u);
+        QWEN4_ALLOC(mtp_ids, 3u);
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
@@ -60258,26 +60262,84 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
-/* host side: embedding rows tiled into R and the PLE n-gram gather */
+/* CUDA and ROCm gather token embeddings on the GPU from the table uploaded
+ * with the weights.  Their loaders drop the file pages of every span they
+ * upload, so a host row read through the map faults the table back in from
+ * disk one row at a time: a fresh process paid ~1700 serial reads ahead of its
+ * first prefill, with the GPU idle, and their latency follows the SSD's.
+ * Metal maps the GGUF with no-copy buffers and keeps the host rows.  F32 and
+ * Q4_0 tables have no gather kernel and keep them too, as does
+ * DS4_QWEN4_HOST_EMBED=1 (A/B runs and exactness checks). */
+static bool qwen4_gpu_embed_enabled(const ds4_weights *w) {
+#ifdef __APPLE__
+    (void)w;
+    return false;
+#else
+    static int host = -1;
+    if (host < 0) host = getenv("DS4_QWEN4_HOST_EMBED") != NULL;
+    const uint32_t type = w->token_embd->type;
+    return !host && (type == DS4_TENSOR_BF16 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_Q8_0);
+#endif
+}
+
+/* rows <- the n embedding rows (E floats each) of ids, staged through ids_t.
+ * Every type converts exactly as qwen4_ref_row does. */
+static bool qwen4_gpu_embed_rows(const ds4_model *m, const ds4_weights *w, ds4_gpu_tensor *ids_t,
+                                 const int32_t *ids, uint32_t n, ds4_gpu_tensor *rows) {
+    const ds4_tensor *t = w->token_embd;
+    if (!ds4_gpu_tensor_write(ids_t, 0, ids, (uint64_t)n * sizeof(int32_t))) return false;
+    switch (t->type) {
+    case DS4_TENSOR_BF16:
+        return ds4_gpu_glm53_embedding_bf16(rows, m->map, m->size, t->abs_offset, ids_t, n,
+                                            DS4_N_EMBD, DS4_N_VOCAB) != 0;
+    case DS4_TENSOR_F16:
+        return ds4_gpu_embed_tokens_hc_tensor(rows, ids_t, m->map, m->size, t->abs_offset,
+                                              DS4_N_VOCAB, n, DS4_N_EMBD, 1u) != 0;
+    case DS4_TENSOR_Q8_0:
+        return ds4_gpu_embed_tokens_q8_0_tensor(rows, ids_t, m->map, m->size, t->abs_offset,
+                                                DS4_N_VOCAB, n, DS4_N_EMBD) != 0;
+    default:
+        return false;
+    }
+}
+
+/* R <- the embeddings of n tokens repeated into every stream, gathered into
+ * the blk scratch, which layer 0 next writes with its attention output. */
+static bool qwen4_gpu_embed_hc_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                    const int32_t *ids, uint32_t n) {
+    return qwen4_gpu_embed_rows(m, w, g->emb_ids, ids, n, g->blk) &&
+           ds4_gpu_repeat_hc_rows_tensor(g->R, g->blk, n, DS4_N_EMBD, DS4_N_HC) != 0;
+}
+
+_Static_assert(sizeof(int) == sizeof(int32_t), "Qwen token ids are staged as int32");
+
+/* host side: rope positions, the PLE n-gram gather and, when the GPU cannot
+ * gather them (*gpu_embed false: an image row or a table type without a
+ * kernel), the embedding rows tiled into R */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                     const int *tokens, uint32_t T) {
+                                     const int *tokens, uint32_t T, bool *gpu_embed) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
     const ds4_vision_span *spans = g->vis_spans;
     size_t n_spans = g->vis_span_count;
     if (!spans) spans = qwen4_fake_spans(&n_spans);
+    *gpu_embed = qwen4_gpu_embed_enabled(w);
+    for (uint32_t t = 0; t < T && *gpu_embed && n_spans; t++)
+        if (qwen4_span_row(spans, n_spans, g->pos + t)) *gpu_embed = false;
     for (uint32_t t = 0; t < T; t++) {
-        float *dst = row + (uint64_t)t * hc_dim;
-        const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
-        if (img) memcpy(dst, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
-        for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
+        if (!*gpu_embed) {
+            float *dst = row + (uint64_t)t * hc_dim;
+            const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
+            if (img) memcpy(dst, img, E * sizeof(float));
+            else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+            for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
+        }
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
         if (t == 0 && g->snap_after_first) g->snap_mrope_delta = g->mrope_delta;
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
     }
-    if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
+    if ((!*gpu_embed && !ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float))) ||
         !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
         return false;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
@@ -60338,10 +60400,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
     }
     const double t0 = timing ? now_sec() : 0.0;
-    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    bool gpu_embed = false;
+    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, &gpu_embed)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
-    bool ok = true;
+    bool ok = !gpu_embed || qwen4_gpu_embed_hc_rows(g, m, w, (const int32_t *)tokens, T);
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
@@ -60642,14 +60705,17 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
-    for (uint32_t t = 0; t < T; t++) {
+    for (uint32_t t = 0; t < T; t++)
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+    const bool gpu_embed = qwen4_gpu_embed_enabled(w);
+    if (!gpu_embed) {
+        for (uint32_t t = 0; t < T; t++)
+            qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+        if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
     }
-    if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
-        !glm_graph_begin_commands_if_needed()) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
-    bool ok = true;
+    bool ok = !gpu_embed || qwen4_gpu_embed_rows(m, w, g->mtp_ids, (const int32_t *)next_tokens, T, g->mtp_e);
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
@@ -60738,12 +60804,16 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
-    if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes) ||
-        !glm_graph_begin_commands_if_needed()) return false;
+    const bool gpu_embed = qwen4_gpu_embed_enabled(w);
+    if (!gpu_embed) {
+        qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
+        if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes)) return false;
+    }
+    if (!glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
     ds4_gpu_tensor *last = NULL;
-    bool ok = true;
+    const int32_t next_id = next_token;
+    bool ok = !gpu_embed || qwen4_gpu_embed_rows(m, w, g->mtp_ids, &next_id, 1u, g->mtp_e);
     {
         ds4_gpu_tensor *e_row = ds4_gpu_tensor_view(g->mtp_e, 0, emb_bytes);
         ds4_gpu_tensor *R_row = ds4_gpu_tensor_view(g->mtp_R,
