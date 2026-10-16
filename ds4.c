@@ -59250,6 +59250,9 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t mtp_last_rows;  /* rows of the last predictor pass resident in mtp_R */
     size_t vis_span_count;
     float *host_row;
+    /* PLE n-gram row ids of the staged tokens, read after layer 0 is
+     * submitted; shared with the arena like host_row */
+    uint32_t *host_ple_ids;
     float *host_logits;
     ds4_gpu_tensor *steer_dirs;
     float steer_attn_scale;
@@ -59365,8 +59368,10 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         g->batch_logits = g->batch_attn_rows = g->batch_attn_part = g->batch_head_x = g->batch_gdn_rows = NULL;
         g->batch_logit_rows = 0;
         free(g->host_row);
+        free(g->host_ple_ids);
     }
     g->host_row = NULL;
+    g->host_ple_ids = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -59515,6 +59520,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
         DS4_QWEN4_SCRATCH_FIELDS(QWEN4_BORROW)
 #undef QWEN4_BORROW
         g->host_row = shared->host_row;
+        g->host_ple_ids = shared->host_ple_ids;
         goto private_state;
     }
     QWEN4_ALLOC(R, T * hc_dim);
@@ -59565,6 +59571,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
     QWEN4_ALLOC(emb_ids, T);   /* int32 ids in f32-sized slots */
     g->host_row = xmalloc(T * hc_dim * sizeof(float));
+    g->host_ple_ids = xmalloc(T * DS4_MAX_PLE_HEADS * sizeof(uint32_t));
 
 private_state:
     /* The PLE conv history carries across calls and the logits belong to the
@@ -60313,9 +60320,9 @@ static bool qwen4_gpu_embed_hc_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, 
 
 _Static_assert(sizeof(int) == sizeof(int32_t), "Qwen token ids are staged as int32");
 
-/* host side: rope positions, the PLE n-gram gather and, when the GPU cannot
- * gather them (*gpu_embed false: an image row or a table type without a
- * kernel), the embedding rows tiled into R */
+/* host side: rope positions, the PLE n-gram row ids (qwen4_graph_stage_ngrams
+ * reads the rows) and, when the GPU cannot gather them (*gpu_embed false: an
+ * image row or a table type without a kernel), the embedding rows tiled into R */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T, bool *gpu_embed) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
@@ -60342,9 +60349,8 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     if ((!*gpu_embed && !ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float))) ||
         !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
         return false;
-    uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
-        qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
+        qwen4_ple_step(tokens[t], g->ple_prev, g->host_ple_ids + (uint64_t)t * DS4_N_PLE_HEADS);
         if (t == 0 && g->snap_after_first) {
             memcpy(g->snap_ple_prev, g->ple_prev, sizeof(g->snap_ple_prev));
             g->snap_pos = g->pos + 1u;
@@ -60353,16 +60359,30 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             memcpy(g->snap2_ple_prev, g->ple_prev, sizeof(g->snap2_ple_prev));
             g->snap2_pos = g->pos + 2u;
         }
-        if (t % 256u == 255u || t + 1 == T) {
-            const uint32_t start = t / 256u * 256u;
-            if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
-                                  row + (uint64_t)start * E)) {
-                fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
-                return false;
-            }
-        }
     }
-    return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+    return true;
+}
+
+/* The n-gram rows of the staged tokens: disk latency, not compute.  Only the
+ * PLE layer at trunk index one reads them, so on CUDA and ROCm the forward
+ * reads them while the GPU runs layer 0, as the batched decode does on
+ * Metal; Metal and DS4_QWEN4_NO_NGRAM_OVERLAP read them up front. */
+static bool qwen4_ngram_overlap_enabled(void) {
+#ifdef __APPLE__
+    return false;
+#else
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_NO_NGRAM_OVERLAP") != NULL;
+    return !off;
+#endif
+}
+
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m, uint32_t T) {
+    if (!qwen4_ngram_read(m, g->host_ple_ids, (size_t)T * DS4_N_PLE_HEADS, g->host_row)) {
+        fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
+        return false;
+    }
+    return ds4_gpu_tensor_write(g->ple_emb, 0, g->host_row, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
 }
 
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
@@ -60401,7 +60421,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     const double t0 = timing ? now_sec() : 0.0;
     bool gpu_embed = false;
-    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, &gpu_embed)) return false;
+    const bool ngram_overlap = qwen4_ngram_overlap_enabled();
+    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, &gpu_embed) ||
+        (!ngram_overlap && !qwen4_graph_stage_ngrams(g, m, T))) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = !gpu_embed || qwen4_gpu_embed_hc_rows(g, m, w, (const int32_t *)tokens, T);
@@ -60422,7 +60444,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
-            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
+            /* the GPU runs the layers before this one while the host reads */
+            if (ngram_overlap) ok = ds4_gpu_submit_commands() != 0 && qwen4_graph_stage_ngrams(g, m, T);
+            ok = ok && qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
                                                m->map, m->size, l->ple_norm_key->abs_offset,
@@ -60474,9 +60498,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         QWEN4_PROF(5);
         /* Submit this prefix while the host encodes the remaining layers.
-         * Flush keeps the same ordered queue and retains pending buffers;
-         * end_commands below waits for both batches before inputs are reused. */
-        if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+         * Submit keeps the same ordered queue and retains pending buffers;
+         * end_commands below waits for both batches before inputs are reused.
+         * (A flush would also wait for the prefix on CUDA and ROCm.) */
+        if (ok && il + 1u == flush_layer) ok = ds4_gpu_submit_commands() != 0;
     }
     if (prof_on) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "

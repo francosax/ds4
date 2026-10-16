@@ -78,6 +78,11 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+/* Start executing the commands encoded so far without waiting for them, so
+ * the host can do other work (disk reads) while the GPU runs.  Metal commits
+ * the open batch, as flush does; CUDA and ROCm launch every kernel as it is
+ * encoded, so there is nothing to submit, whereas their flush synchronizes. */
+int ds4_gpu_submit_commands(void);
 int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__

@@ -9509,6 +9509,10 @@ int ds4_gpu_flush_encoder(void) {
     return 1;
 }
 
+int ds4_gpu_submit_commands(void) {
+    return ds4_gpu_flush_commands();
+}
+
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
