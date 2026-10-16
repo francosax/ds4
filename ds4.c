@@ -58969,6 +58969,23 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     return true;
 }
 
+/* Queue the read of one row without waiting for it.  The table is opened
+ * FADV_RANDOM, so a pread fetches only its own page and a reader issues one
+ * at a time; advising every row first puts the whole set on the NVMe queue
+ * together.  Cold on Strix Halo: an 8K prefill's 131072 rows 3.0 -> 1.5 s
+ * with 16 readers, a decode token's 16 rows 3.1 -> 0.65 ms.  A cached row
+ * costs one syscall. */
+static void qwen4_ngram_advise(const ds4_model *m, uint32_t row) {
+#if !defined(__APPLE__) && defined(POSIX_FADV_WILLNEED)
+    const uint64_t bytes = m->ngram_tensor->dim[0] * 2u;
+    (void)posix_fadvise(m->ngram_fd, (off_t)(m->ngram_tensor->abs_offset + (uint64_t)row * bytes),
+                        (off_t)bytes, POSIX_FADV_WILLNEED);
+#else
+    (void)m;
+    (void)row;
+#endif
+}
+
 typedef struct { uint32_t row, output; } qwen4_ngram_request;
 typedef struct {
     const ds4_model *model;
@@ -58988,6 +59005,8 @@ static void qwen4_ngram_part(void *context, size_t part) {
     const size_t begin = b->count * part / b->readers, end = b->count * (part+1) / b->readers;
     const size_t width = b->model->ngram_tensor->dim[0];
     float *previous = NULL;
+    for (size_t i = begin; i < end; i++)
+        if (i == begin || b->request[i].row != b->request[i-1].row) qwen4_ngram_advise(b->model, b->request[i].row);
     for (size_t i = begin; i < end; i++) {
         float *dst = b->out + b->request[i].output * width;
         if (i > begin && b->request[i].row == b->request[i-1].row) {
@@ -59028,6 +59047,7 @@ static bool qwen4_ngram_read(const ds4_model *m, const uint32_t *rows, size_t co
     if (count < 2) return count == 0 || qwen4_ngram_row(m, rows[0], out);
 #else
     if (count < 256) {
+        for (size_t i = 0; i < count; i++) qwen4_ngram_advise(m, rows[i]);
         for (size_t i = 0; i < count; i++)
             if (!qwen4_ngram_row(m, rows[i], out + i * m->ngram_tensor->dim[0])) return false;
         return true;
