@@ -60892,6 +60892,11 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
+    /* the trunk has not written this position's rope row yet */
+    uint32_t next_pos[4] = {0};
+    int32_t delta = g->mrope_delta;
+    qwen4_mrope_pos(NULL, 0, idx, &delta, next_pos);
+    if (!ds4_gpu_tensor_write(g->pos3, (uint64_t)idx * sizeof(next_pos), next_pos, sizeof(next_pos))) return false;
     const bool gpu_embed = qwen4_gpu_embed_enabled(w);
     if (!gpu_embed) {
         qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
