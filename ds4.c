@@ -59268,6 +59268,7 @@ typedef struct ds4_qwen4_gpu_graph {
     int32_t snap_mrope_delta;
     const ds4_vision_span *vis_spans;
     uint32_t mtp_last_rows;  /* rows of the last predictor pass resident in mtp_R */
+    uint32_t mtp_dirty;      /* one past the last predictor cache row written since it was cleared */
     size_t vis_span_count;
     float *host_row;
     /* PLE n-gram row ids of the staged tokens, read after layer 0 is
@@ -59524,6 +59525,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
     g->n_block_cap = ctx_cap / 4u + 1u;
+    /* the predictor caches are allocated uninitialized: the first reset
+     * clears all of them */
+    g->mtp_dirty = ctx_cap;
     static bool warned_ctx = false;
     if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
         warned_ctx = true;
@@ -59736,8 +59740,45 @@ static void qwen4_graph_dump_last_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint
     (void)glm_graph_begin_commands_if_needed();
 }
 
+static void qwen4_graph_zero_span(ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes) {
+    static const uint8_t zero[4] = {0};
+    ds4_gpu_tensor *v = t && bytes ? ds4_gpu_tensor_view(t, offset, bytes) : NULL;
+    if (!v) return;
+    (void)ds4_gpu_tensor_fill_f32(v, 0.0f, bytes / 4u);
+    if (bytes & 3u) (void)ds4_gpu_tensor_write(v, bytes & ~(uint64_t)3u, zero, bytes & 3u);
+    ds4_gpu_tensor_free(v);
+}
+
+/* The predictor layer appends to its attention caches only at the positions
+ * it runs on, and its attention reads every row up to the current one.
+ * Prompt rows are never written, so without this they keep what an earlier
+ * prompt left at the same positions and the drafts depend on the session's
+ * history.  Clear the rows from start on that a predictor pass has written;
+ * unwritten rows then read as zeros, as they do in a fresh session.  The
+ * caller has synchronized the device. */
+static void qwen4_graph_mtp_cache_clear_from(ds4_qwen4_gpu_graph *g, uint32_t start) {
+    const uint32_t end = g->mtp_dirty < g->ctx_cap ? g->mtp_dirty : g->ctx_cap;
+    if (end <= start) return;
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    const uint64_t ik_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const uint64_t bk_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
+    /* a pooled block key is stale as soon as one of its four tokens is */
+    const uint32_t b0 = start / 4u;
+    uint32_t b1 = (end + 3u) / 4u;
+    if (b1 > g->n_block_cap) b1 = g->n_block_cap;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen4_layer_is_nextn(il) || !g->layer_k_cache[il]) continue;
+        qwen4_graph_zero_span(g->layer_k_cache[il], start * kv_row, (end - start) * kv_row);
+        qwen4_graph_zero_span(g->layer_v_cache[il], start * kv_row, (end - start) * kv_row);
+        qwen4_graph_zero_span(g->layer_ik_cache[il], start * ik_row, (end - start) * ik_row);
+        if (b1 > b0) qwen4_graph_zero_span(g->layer_block_key[il], b0 * bk_row, (b1 - b0) * bk_row);
+    }
+    g->mtp_dirty = start;
+}
+
 static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     (void)ds4_gpu_synchronize();
+    qwen4_graph_mtp_cache_clear_from(g, 0);
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -60752,6 +60793,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const ds4_layer_weights *l = &w->layer[il];
     for (uint32_t t = 0; t < T; t++)
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
+    if (idx + T > g->mtp_dirty) g->mtp_dirty = idx + T;
     const bool gpu_embed = qwen4_gpu_embed_enabled(w);
     if (!gpu_embed) {
         for (uint32_t t = 0; t < T; t++)
@@ -60843,6 +60885,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
                                        int next_token, uint32_t idx, int *draft_out) {
     if (!g->mtp_R || g->mtp_last_rows == 0u || g->mtp_last_rows > 3u || !draft_out ||
         idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
+    if (idx + 1u > g->mtp_dirty) g->mtp_dirty = idx + 1u;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -64510,6 +64553,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         payload_set_err(err, errlen, "KV checkpoint MTP rows exceed the token count");
         rc = 1;
     }
+    if (rc == 0 && mtp_rows > g->mtp_dirty) g->mtp_dirty = mtp_rows;
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
@@ -64560,6 +64604,9 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         s->checkpoint.len = 0;
         return 1;
     }
+    /* the checkpoint carries the predictor rows below mtp_rows only */
+    (void)ds4_gpu_synchronize();
+    qwen4_graph_mtp_cache_clear_from(g, mtp_rows);
     g->pos = rows;
     g->mtp_pos = mtp_rows;
     token_vec_free(&s->checkpoint);
@@ -77502,6 +77549,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             start = s->checkpoint.len;
+            /* predictor rows past the kept transcript belong to a discarded
+             * continuation */
+            if (s->qwen4_graph.mtp_dirty > (uint32_t)start) {
+                (void)ds4_gpu_synchronize();
+                qwen4_graph_mtp_cache_clear_from(&s->qwen4_graph, (uint32_t)start);
+            }
         } else {
             qwen4_graph_reset(&s->qwen4_graph);
             s->checkpoint.len = 0;
@@ -81133,6 +81186,10 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
             e->use_sel = e->pos >= sparse_pos;
             if (e->pos >= r->ctx_cap) return false;
         }
+    }
+    for (int i = 0; i < count; i++) {
+        ds4_qwen4_gpu_graph *r = &mem[i].session->qwen4_graph;
+        if (idx0[i] + mem[i].n > r->mtp_dirty) r->mtp_dirty = idx0[i] + mem[i].n;
     }
     for (uint32_t t = 0; t < N; t++)
         qwen4_ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
